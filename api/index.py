@@ -130,3 +130,106 @@ def action_firewall(payload: dict):
 
     # No rule failed
     return allow()
+
+##################################
+# ---- q3 -----------------------
+##################################
+import re
+from typing import Literal, Optional
+
+class TFState(BaseModel):
+    model_config = ConfigDict(strict=True)
+    backend: str
+    locked: bool
+
+class TFResource(BaseModel):
+    model_config = ConfigDict(strict=True)
+    address: str
+    type: str
+    action: Literal["create", "update", "delete"]
+    labels: dict
+    secret: Optional[str] = None
+    forceDestroy: bool
+
+class TerraformPlanRequest(BaseModel):
+    model_config = ConfigDict(strict=True)
+    environment: str
+    state: TFState
+    providerVersion: str
+    destroyApproved: bool
+    resource: TFResource
+
+
+# ---- OUTPUT shape (what you send back) ----
+
+class TerraformPlanResponse(BaseModel):
+    decision: Literal["approve", "reject"]
+    reason: str
+
+
+# ---- constants for your assigned scope ----
+
+PROD_WORKSPACE = "prod-l722ec"
+REQUIRED_LABELS = {
+    "owner": "student-6sp9e",
+    "environment": "production",
+    "cost_center": "cc-5sj8",
+}
+VALID_BACKENDS = {"gcs", "s3", "azurerm", "remote"}
+PROTECTED_DELETE_TYPES = {"storage_bucket", "sql_database", "persistent_disk"}
+
+EXACT_VERSION_RE = re.compile(r"^=?\s*\d+\.\d+\.\d+$")
+PESSIMISTIC_VERSION_RE = re.compile(r"^~>\s*\d+(\.\d+){1,2}$")
+
+
+def is_pinned_version(v: str) -> bool:
+    v = v.strip()
+    if v.lower() == "latest":
+        return False
+    if ">=" in v or "*" in v:
+        return False
+    return bool(EXACT_VERSION_RE.match(v) or PESSIMISTIC_VERSION_RE.match(v))
+
+
+@app.post("/q3/terraform/plan", response_model=TerraformPlanResponse)
+def terraform_plan(body: dict):
+    # Rule 1: schema/type validation
+    try:
+        plan = TerraformPlanRequest(**body)
+    except ValidationError:
+        return TerraformPlanResponse(decision="reject", reason="INVALID_PLAN")
+
+    # Rule 2: environment must match assigned workspace
+    if plan.environment != PROD_WORKSPACE:
+        return TerraformPlanResponse(decision="reject", reason="ENVIRONMENT_MISMATCH")
+
+    # Rule 3: state must use an allowed backend AND be locked
+    if plan.state.backend not in VALID_BACKENDS or not plan.state.locked:
+        return TerraformPlanResponse(decision="reject", reason="STATE_UNSAFE")
+
+    # Rule 4: provider version must be pinned (exact or pessimistic)
+    if not is_pinned_version(plan.providerVersion):
+        return TerraformPlanResponse(decision="reject", reason="UNPINNED_PROVIDER")
+
+    # Rule 5: all three required labels must be present with exact values
+    for key, value in REQUIRED_LABELS.items():
+        if plan.resource.labels.get(key) != value:
+            return TerraformPlanResponse(decision="reject", reason="MISSING_LABELS")
+
+    # Rule 6: secret must be null or a non-empty secret://... reference
+    secret = plan.resource.secret
+    if secret is not None:
+        if not secret.startswith("secret://") or secret == "secret://":
+            return TerraformPlanResponse(decision="reject", reason="PLAINTEXT_SECRET")
+
+    # Rule 7: deleting a protected resource type requires explicit approval
+    if plan.resource.action == "delete" and plan.resource.type in PROTECTED_DELETE_TYPES:
+        if not plan.destroyApproved:
+            return TerraformPlanResponse(decision="reject", reason="DELETE_NOT_APPROVED")
+
+    # Rule 8: a production storage_bucket may never use forceDestroy: true
+    if plan.resource.type == "storage_bucket" and plan.resource.forceDestroy:
+        return TerraformPlanResponse(decision="reject", reason="FORCE_DESTROY")
+
+    # All rules passed
+    return TerraformPlanResponse(decision="approve", reason="APPROVE")
