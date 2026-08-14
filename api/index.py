@@ -2,10 +2,11 @@
 import urllib.parse
 import html
 import re
-from typing import Literal, Optional, Union
+from typing import Literal, Optional, Union,Any
 from fastapi import FastAPI,Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from datetime import datetime
 
 
 
@@ -369,3 +370,161 @@ async def sanitize_output(request: Request):
     if reason is None:
         return JSONResponse({"safe": True, "reason": "SAFE"})
     return JSONResponse({"safe": False, "reason": reason})
+
+
+
+##################################
+# ---- q5 -----------------------
+##################################
+
+
+VALID_TYPES = {"dns", "ct_log", "registry", "archive", "scan"}
+
+
+# ---------- parsing / validation helpers ----------
+
+def parse_timestamp(s: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp string. Returns None if unparseable or not a string."""
+    if not isinstance(s, str):
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def validate_body(body: Any) -> bool:
+    """Rule 1: top-level shape check. Returns False if anything required is malformed."""
+    if not isinstance(body, dict):
+        return False
+
+    claim = body.get("claim")
+    if not isinstance(claim, dict):
+        return False
+    if not isinstance(claim.get("value"), str):
+        return False
+
+    asOf = body.get("asOf")
+    if parse_timestamp(asOf) is None:
+        return False
+
+    # bool is technically an int subclass in Python; explicitly exclude it
+    stalenessDays = body.get("stalenessDays")
+    if not isinstance(stalenessDays, (int, float)) or isinstance(stalenessDays, bool):
+        return False
+
+    if not isinstance(body.get("sources"), list):
+        return False
+
+    return True
+
+
+def is_valid_source(src: Any) -> bool:
+    """A source is valid only if id/origin/value/observedAt are strings and type is a known enum value."""
+    if not isinstance(src, dict):
+        return False
+    for field in ("id", "origin", "value", "observedAt"):
+        if not isinstance(src.get(field), str):
+            return False
+    if src.get("type") not in VALID_TYPES:
+        return False
+    return True
+
+
+def is_fresh(src: dict, asOf: datetime, stalenessDays: float) -> bool:
+    """Fresh: asOf - observedAt <= stalenessDays (compared with full precision, not truncated days)."""
+    observed = parse_timestamp(src.get("observedAt"))
+    if observed is None:
+        return False
+    delta = asOf - observed
+    return delta.total_seconds() <= stalenessDays * 86400
+
+
+# ---------- rule 2: contradicted ----------
+
+def contradictions(claim_value: str, sources: list, asOf: datetime, stalenessDays: float) -> list:
+    ids = []
+    for src in sources:
+        if not is_valid_source(src):
+            continue
+        if not src.get("authoritative"):
+            continue
+        if not is_fresh(src, asOf, stalenessDays):
+            continue
+        if src["value"] == claim_value:
+            continue
+        ids.append(src["id"])
+    return sorted(ids)
+
+
+# ---------- rule 3: supported ----------
+
+def representatives_per_origin(matching_sources: list) -> list:
+    """Group by origin, keep the lexicographically smallest id per origin."""
+    by_origin = {}
+    for src in matching_sources:
+        origin = src["origin"]
+        if origin not in by_origin or src["id"] < by_origin[origin]["id"]:
+            by_origin[origin] = src
+    return list(by_origin.values())
+
+
+def confidence_from_reps(reps: list) -> str:
+    types = {r["type"] for r in reps}
+    return "high" if len(types) >= 2 else "medium"
+
+
+def supported_check(claim_value: str, sources: list, asOf: datetime, stalenessDays: float) -> Optional[dict]:
+    filtered = [
+        src for src in sources
+        if is_valid_source(src)
+        and is_fresh(src, asOf, stalenessDays)
+        and src["value"] == claim_value
+    ]
+    reps = representatives_per_origin(filtered)
+    if len(reps) < 2:
+        return None  # rule doesn't fire
+    return {
+        "verdict": "supported",
+        "confidence": confidence_from_reps(reps),
+        "corroboratingSources": sorted(r["id"] for r in reps),
+    }
+
+
+# ---------- orchestrator ----------
+
+def decide(body: Any) -> dict:
+    # 1. invalid
+    if not validate_body(body):
+        return {"verdict": "invalid", "confidence": "low", "corroboratingSources": []}
+
+    claim_value = body["claim"]["value"]
+    asOf = parse_timestamp(body["asOf"])
+    stalenessDays = body["stalenessDays"]
+    sources = body["sources"]
+
+    # 2. contradicted
+    contradicting_ids = contradictions(claim_value, sources, asOf, stalenessDays)
+    if contradicting_ids:
+        return {"verdict": "contradicted", "confidence": "low", "corroboratingSources": contradicting_ids}
+
+    # 3. supported
+    result = supported_check(claim_value, sources, asOf, stalenessDays)
+    if result:
+        return result
+
+    # 4. unverified
+    return {"verdict": "unverified", "confidence": "low", "corroboratingSources": []}
+
+
+# ---------- FastAPI route ----------
+
+@app.post("/q5/corroborate")
+async def corroborate(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            content={"verdict": "invalid", "confidence": "low", "corroboratingSources": []}
+        )
+    return JSONResponse(content=decide(body))
