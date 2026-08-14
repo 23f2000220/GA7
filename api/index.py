@@ -1,11 +1,20 @@
+
+import urllib.parse
+import html
 import re
 from typing import Literal, Optional, Union
-
-from fastapi import FastAPI
+from fastapi import FastAPI,Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+
 
 app = FastAPI()
 
+
+##################################
+# ---- q2 -----------------------
+##################################
 # ---- Assigned scope ---------------------------------------------------
 TENANT_ID = "tenant-9solhek"
 EMAIL_DOMAIN = "notify-3jc6d8n.example"
@@ -233,3 +242,124 @@ def terraform_plan(body: dict):
 
     # All rules passed
     return TerraformPlanResponse(decision="approve", reason="APPROVE")
+
+
+
+##################################
+# ---- q4 -----------------------
+##################################
+
+
+ALLOWED_HOSTS = {"cdn-dcl8mta.example", "app-mcawlsi.example"}
+VALID_CHANNELS = {"html", "markdown", "url", "sql", "shell"}
+MAX_LEN = 20000
+
+
+def multi_step_decode(input_string):
+    # Step 1: Percent-decode
+    step1 = urllib.parse.unquote(input_string)
+    # Step 2: HTML-entity-decode (named, numeric, hex)
+    step2 = html.unescape(step1)
+    # Step 3: \uXXXX unicode escape decode
+    try:
+        step3 = re.sub(
+            r'\\u([0-9a-fA-F]{4})',
+            lambda m: chr(int(m.group(1), 16)),
+            step2
+        )
+    except Exception:
+        step3 = step2
+    return step3
+
+
+SCRIPT_TAG_RE = re.compile(r'<\s*(script|iframe|object|embed)\b', re.IGNORECASE)
+EVENT_HANDLER_RE = re.compile(r'\bon[a-zA-Z]+\s*=', re.IGNORECASE)
+DANGEROUS_SCHEME_TEXT_RE = re.compile(r'\b(javascript|data|vbscript)\s*:', re.IGNORECASE)
+
+HTML_ATTR_URL_RE = re.compile(r'(?:src|href)\s*=\s*["\']([^"\']*)["\']', re.IGNORECASE)
+MARKDOWN_URL_RE = re.compile(r'\]\(([^)]*)\)')
+
+SQL_METACHAR_RE = re.compile(r"""('|"|;|--|/\*|\bunion\b|\bor\s+1\s*=\s*1\b)""", re.IGNORECASE)
+SHELL_METACHAR_RE = re.compile(r'[;&|`<>]|\$\(|\$\{')
+
+
+def extract_urls(channel, text):
+    if channel == "html":
+        print("TESTING", HTML_ATTR_URL_RE.findall(text))
+        return HTML_ATTR_URL_RE.findall(text)
+    if channel == "markdown":
+        print("TESTING", MARKDOWN_URL_RE.findall(text))
+        return MARKDOWN_URL_RE.findall(text)
+    if channel == "url":
+        print("TESTING", text.strip())
+        return [text.strip()]
+    return []
+
+
+def get_hostname(raw_url):
+    """Returns (scheme, hostname) for an absolute reference, or (None, None)
+    for a relative one. Protocol-relative //host counts as absolute https."""
+    u = raw_url.strip()
+    if not u:
+        return None, None
+    parsed = urllib.parse.urlsplit(u)
+    if not parsed.netloc:
+        return None, None  # relative reference like /local/page -> fine
+    scheme = parsed.scheme.lower() if parsed.scheme else "https"  # //host -> https
+    return scheme, parsed.hostname  # .hostname strips credentials + port for us
+
+
+def check_scheme_and_exfil(channel, text):
+    if DANGEROUS_SCHEME_TEXT_RE.search(text):
+        return "DANGEROUS_SCHEME"
+    for raw_url in extract_urls(channel, text):
+        scheme, hostname = get_hostname(raw_url)
+        if hostname is None:
+            continue
+        if scheme not in ("http", "https"):
+            return "DANGEROUS_SCHEME"
+        if hostname not in ALLOWED_HOSTS:
+            return "EXTERNAL_EXFIL"
+    return None
+
+
+def check_channel_rules(channel, text):
+    if channel == "html":
+        if SCRIPT_TAG_RE.search(text):
+            return "SCRIPT_TAG"
+        if EVENT_HANDLER_RE.search(text):
+            return "EVENT_HANDLER"
+        return check_scheme_and_exfil(channel, text)
+    if channel in ("markdown", "url"):
+        return check_scheme_and_exfil(channel, text)
+    if channel == "sql":
+        return "SQL_METACHAR" if SQL_METACHAR_RE.search(text) else None
+    if channel == "shell":
+        return "SHELL_METACHAR" if SHELL_METACHAR_RE.search(text) else None
+    return None
+
+
+@app.post("/q4/sanitize-output")
+async def sanitize_output(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"safe": False, "reason": "INVALID_SCHEMA"})
+
+    if not isinstance(body, dict):
+        return JSONResponse({"safe": False, "reason": "INVALID_SCHEMA"})
+
+    channel = body.get("channel")
+    output = body.get("output")
+
+    if channel not in VALID_CHANNELS or not isinstance(output, str) or len(output) > MAX_LEN:
+        return JSONResponse({"safe": False, "reason": "INVALID_SCHEMA"})
+
+    decoded = multi_step_decode(output)
+    if decoded != output and check_channel_rules(channel, decoded) is not None:
+        return JSONResponse({"safe": False, "reason": "ENCODED_PAYLOAD"})
+
+    reason = check_channel_rules(channel, output)
+    if reason is None:
+        return JSONResponse({"safe": True, "reason": "SAFE"})
+    return JSONResponse({"safe": False, "reason": reason})
