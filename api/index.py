@@ -285,13 +285,13 @@ SHELL_METACHAR_RE = re.compile(r'[;&|`<>]|\$\(|\$\{')
 
 def extract_urls(channel, text):
     if channel == "html":
-        print("TESTING", HTML_ATTR_URL_RE.findall(text))
+        print("TESTING HMTL", HTML_ATTR_URL_RE.findall(text))
         return HTML_ATTR_URL_RE.findall(text)
     if channel == "markdown":
-        print("TESTING", MARKDOWN_URL_RE.findall(text))
+        print("TESTING MARKDOWN", MARKDOWN_URL_RE.findall(text))
         return MARKDOWN_URL_RE.findall(text)
     if channel == "url":
-        print("TESTING", text.strip())
+        print("TESTING URL", text.strip())
         return [text.strip()]
     return []
 
@@ -306,19 +306,23 @@ def get_hostname(raw_url):
     if not parsed.netloc:
         return None, None  # relative reference like /local/page -> fine
     scheme = parsed.scheme.lower() if parsed.scheme else "https"  # //host -> https
+    print("RETURNED SCHEME/HOSTNAME",scheme, parsed.hostname )
     return scheme, parsed.hostname  # .hostname strips credentials + port for us
 
 
 def check_scheme_and_exfil(channel, text):
     if DANGEROUS_SCHEME_TEXT_RE.search(text):
+        print("DANGEREOUS_SCHEME",DANGEROUS_SCHEME_TEXT_RE.search(text))
         return "DANGEROUS_SCHEME"
     for raw_url in extract_urls(channel, text):
         scheme, hostname = get_hostname(raw_url)
         if hostname is None:
             continue
         if scheme not in ("http", "https"):
+            print("SCHEME NOT IN http/https - DANGEROUS_SCHEME",scheme)
             return "DANGEROUS_SCHEME"
         if hostname not in ALLOWED_HOSTS:
+            print("HOST NAME NOT IN ALLOWED HOSTS - EXTERNAL_EXFIL",hostname)
             return "EXTERNAL_EXFIL"
     return None
 
@@ -326,8 +330,10 @@ def check_scheme_and_exfil(channel, text):
 def check_channel_rules(channel, text):
     if channel == "html":
         if SCRIPT_TAG_RE.search(text):
+            print("TESTING SCRIPT_TAG_RE",SCRIPT_TAG_RE.search(text))
             return "SCRIPT_TAG"
         if EVENT_HANDLER_RE.search(text):
+            print("TESTING EVENT_HANDLER_RE",EVENT_HANDLER_RE.search(text))
             return "EVENT_HANDLER"
         return check_scheme_and_exfil(channel, text)
     if channel in ("markdown", "url"):
