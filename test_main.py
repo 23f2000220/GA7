@@ -77,19 +77,19 @@ EXPECTED_UNSAFE_MULTI = {
 
 
 def test_safe_preview_promotes():
-    result = evaluate(SAFE_PREVIEW)
+    result = evaluate_release_gate(SAFE_PREVIEW)
     assert result["decision"] == "promote", result
     assert result["violations"] == []
 
 
 def test_safe_preview_shuffled_key_order_still_promotes():
-    result = evaluate(SAFE_PREVIEW_SHUFFLED)
+    result = evaluate_release_gate(SAFE_PREVIEW_SHUFFLED)
     assert result["decision"] == "promote", result
     assert result["violations"] == []
 
 
 def test_unsafe_multi_failure_blocks_with_all_codes():
-    result = evaluate(UNSAFE_MULTI)
+    result = evaluate_release_gate(UNSAFE_MULTI)
     assert result["decision"] == "block"
     assert set(result["violations"]) == EXPECTED_UNSAFE_MULTI, (
         set(result["violations"]) ^ EXPECTED_UNSAFE_MULTI
@@ -103,7 +103,7 @@ def test_production_happy_path_promotes():
     prod_safe["ref"] = "refs/heads/main"
     prod_safe["workflow"]["trigger"] = "push"
     prod_safe["workflow"]["environmentApproval"] = True
-    result = evaluate(prod_safe)
+    result = evaluate_release_gate(prod_safe)
     assert result["decision"] == "promote", result
 
 
