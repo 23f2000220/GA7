@@ -3,7 +3,7 @@ import urllib.parse
 import html
 import re
 from typing import Literal, Optional, Union,Any
-from fastapi import FastAPI,Request
+from fastapi import FastAPI,Request,Body
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from datetime import datetime
@@ -12,6 +12,97 @@ from datetime import datetime
 
 app = FastAPI()
 
+
+##################################
+# ---- q1 -----------------------
+##################################
+
+# =========================================================
+# GA7-Q1: Release Gate
+# =========================================================
+
+RELEASE_GATE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+RELEASE_GATE_REQUIRED_PERMISSIONS = {
+    "contents": "read",
+    "packages": "write",
+    "id-token": "none",
+}
+
+
+def _rg_check_permissions(body: dict) -> list[str]:
+    perms = body.get("workflow", {}).get("permissions", {})
+    if perms != RELEASE_GATE_REQUIRED_PERMISSIONS:
+        return ["EXCESS_PERMISSION"]
+    return []
+
+
+def _rg_check_trigger_and_tests(body: dict) -> list[str]:
+    violations: list[str] = []
+    wf = body.get("workflow", {})
+    if wf.get("trigger") == "pull_request_target":
+        violations.append("UNSAFE_PR_TRIGGER")
+    if (
+        wf.get("testsPassed") is not True
+        or wf.get("matrixComplete") is not True
+        or wf.get("failFast") is not False
+    ):
+        violations.append("TESTS_INCOMPLETE")
+    return violations
+
+
+def _rg_check_actions_pinning(body: dict) -> list[str]:
+    actions = body.get("workflow", {}).get("actions", [])
+    for action in actions:
+        if action.get("owner") == "actions":
+            continue
+        ref = action.get("ref", "")
+        if not RELEASE_GATE_SHA_RE.match(ref):
+            return ["MUTABLE_ACTION"]
+    return []
+
+
+def _rg_check_image(body: dict) -> list[str]:
+    violations: list[str] = []
+    img = body.get("image", {})
+    if img.get("multiStage") is not True:
+        violations.append("SINGLE_STAGE_IMAGE")
+    if img.get("runsAsRoot") is not False:
+        violations.append("ROOT_RUNTIME")
+    if img.get("secretMode") not in ("none", "buildkit"):
+        violations.append("SECRET_IN_LAYER")
+    if img.get("criticalVulnerabilities", 1) != 0:
+        violations.append("CRITICAL_CVE")
+    if img.get("digestPinned") is not True:
+        violations.append("UNPINNED_IMAGE")
+    return violations
+
+
+def _rg_check_production_gate(body: dict) -> list[str]:
+    violations: list[str] = []
+    if body.get("target") != "production":
+        return violations
+    if body.get("event") != "push" or body.get("ref") != "refs/heads/main":
+        violations.append("INVALID_PRODUCTION_REF")
+    if body.get("workflow", {}).get("environmentApproval") is not True:
+        violations.append("APPROVAL_REQUIRED")
+    return violations
+
+
+def evaluate_release_gate(body: dict) -> dict[str, Any]:
+    violations: list[str] = []
+    violations += _rg_check_permissions(body)
+    violations += _rg_check_trigger_and_tests(body)
+    violations += _rg_check_actions_pinning(body)
+    violations += _rg_check_image(body)
+    violations += _rg_check_production_gate(body)
+
+    decision = "promote" if not violations else "block"
+    return {"decision": decision, "violations": violations}
+
+
+@app.post("/q1/release-gate")
+def release_gate(body: dict = Body(...)):
+    return evaluate_release_gate(body)
 
 ##################################
 # ---- q2 -----------------------
